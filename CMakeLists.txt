@@ -7,7 +7,7 @@ find_package(ThermoFun REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
 add_library(USEREOS SHARED src/reaktoro-usereos.cpp src/reaktoro-usereos.hpp)
-target_link_libraries(USEREOS PUBLIC Reaktoro::Reaktoro ThermoFun::ThermoFun)
+target_link_libraries(USEREOS PUBLIC Reaktoro::Reaktoro ThermoFun::ThermoFun nlohmann_json)
 target_include_directories(USEREOS PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>"
                                           "$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_INCLUDEDIR}>")
 

@@ -3,7 +3,12 @@
 #include <Reaktoro/Reaktoro.hpp>
 #include <ThermoFun/ThermoFun.h>
 
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
+
 #include <array>
+#include <fstream>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -18,6 +23,11 @@ double solidViscosity = 1e7;
 
 } // namespace
 
+struct Linspace {
+  double from, to;
+  int count;
+};
+
 std::vector<double> linspace(double begin, double end, int count) {
   std::vector<double> result(count);
   for (int i = 0; i < count; ++i) {
@@ -25,6 +35,77 @@ std::vector<double> linspace(double begin, double end, int count) {
     result[i] = x * (end - begin) + begin;
   }
   return result;
+}
+
+std::vector<double> linspace(const Linspace &ls) { return linspace(ls.from, ls.to, ls.count); }
+
+void to_json(json &j, const Linspace &ls) { j = json{{"from", ls.from}, {"to", ls.to}, {"count", ls.count}}; }
+
+void from_json(const json &j, Linspace &ls) {
+  j.at("from").get_to(ls.from);
+  j.at("to").get_to(ls.to);
+  j.at("count").get_to(ls.count);
+}
+
+struct UserEosConfig {
+  std::string databasePath;
+
+  Linspace temperatureGrid;
+  Linspace pressureGrid;
+
+  std::string aqueousPhaseElements = "";
+  std::string aqueousPhaseSpecies  = "";
+
+  std::string mineralPhaseElements = "";
+  std::string mineralPhaseSpecies  = "";
+
+  std::string gaseousPhaseElements = "";
+  std::string gaseousPhaseSpecies  = "";
+};
+
+UserEosConfig readConfigFromFile(std::string_view path) {
+  std::ifstream in(path.data());
+  json j;
+  in >> j;
+
+  UserEosConfig cfg;
+
+  j.at("database").get_to(cfg.databasePath);
+  auto itp = j.at("interpolationGrid");
+  itp.at("temperatureC").get_to(cfg.temperatureGrid);
+  itp.at("pressureBar").get_to(cfg.pressureGrid);
+
+  if (j.contains("aqueousPhase")) {
+    auto aq = j["aqueousPhase"];
+    if (aq.contains("fromElements")) {
+      aq["fromElements"].get_to(cfg.aqueousPhaseElements);
+    }
+    if (aq.contains("fromSpecies")) {
+      aq["fromSpecies"].get_to(cfg.aqueousPhaseSpecies);
+    }
+  }
+
+  if (j.contains("mineralPhase")) {
+    auto aq = j["mineralPhase"];
+    if (aq.contains("fromElements")) {
+      aq["fromElements"].get_to(cfg.mineralPhaseElements);
+    }
+    if (aq.contains("fromSpecies")) {
+      aq["fromSpecies"].get_to(cfg.mineralPhaseSpecies);
+    }
+
+    if (j.contains("gaseousPhase")) {
+      auto aq = j["gaseousPhase"];
+      if (aq.contains("fromElements")) {
+        aq["fromElements"].get_to(cfg.gaseousPhaseElements);
+      }
+      if (aq.contains("fromSpecies")) {
+        aq["fromSpecies"].get_to(cfg.gaseousPhaseSpecies);
+      }
+    }
+  }
+
+  return cfg;
 }
 
 class UserEosModule {
@@ -42,7 +123,8 @@ public:
 
 private:
   void updateParams();
-  void logFailedParams(const double P, const double T, const double z[]) const;
+  void logFailedParams(const double z[], const Reaktoro::EquilibriumProblem &problem) const;
+  void logFailedParams(const double z[]) const;
 
   Reaktoro::ChemicalEditor m_editor;
   Reaktoro::ChemicalSystem m_system;
@@ -64,10 +146,26 @@ private:
 };
 
 int UserEosModule::initialize(const std::string &configPath) {
+  UserEosConfig cfg;
+
+  try {
+    cfg = readConfigFromFile(configPath);
+  } catch (std::exception &e) {
+    std::cerr << "Error: failed to read config file\n" << e.what() << std::endl;
+  }
+
+  std::cout << "Loaded config:\n";
+  std::cout << "Database: '" << cfg.databasePath << "'\n";
+  std::cout << "Interpolation grid:\n";
+  std::cout << "  Temperature (C): [" << cfg.temperatureGrid.from << ' ' << cfg.temperatureGrid.to << "] / "
+            << cfg.temperatureGrid.count << " points\n";
+  std::cout << "  Pressure (bar): [" << cfg.pressureGrid.from << ' ' << cfg.pressureGrid.to << "] / "
+            << cfg.pressureGrid.count << " points\n";
+
   std::cout << "Loading database... ";
   ThermoFun::Database db;
   try {
-    db       = ThermoFun::Database(configPath);
+    db       = ThermoFun::Database(cfg.databasePath);
     m_editor = Reaktoro::ChemicalEditor(db);
   } catch (std::exception &e) {
     std::cerr << "Error: " << e.what() << std::endl;
@@ -76,15 +174,37 @@ int UserEosModule::initialize(const std::string &configPath) {
 
   std::cout << "Done" << std::endl;
 
-  std::vector<double> pressures    = linspace(1000, 2500, 51);
-  std::vector<double> temperatures = linspace(200, 500, 51);
+  std::vector<double> pressures    = linspace(cfg.pressureGrid);
+  std::vector<double> temperatures = linspace(cfg.temperatureGrid);
 
   m_editor.setPressures(pressures, "bar");
   m_editor.setTemperatures(temperatures, "degC");
 
   try {
-    m_editor.addAqueousPhaseWithElements("H O Na Cl Cu S Si");
-    m_editor.addMineralPhase("Halite Chalcocite Quartz");
+    if (cfg.aqueousPhaseElements != "") {
+      std::cout << "Add aqueous phase with elements: " << cfg.aqueousPhaseElements << std::endl;
+      m_editor.addAqueousPhaseWithElements(cfg.aqueousPhaseElements);
+    }
+    if (cfg.aqueousPhaseSpecies != "") {
+      std::cout << "Add aqueous phase with species: " << cfg.aqueousPhaseSpecies << std::endl;
+      m_editor.addAqueousPhase(cfg.aqueousPhaseSpecies);
+    }
+    if (cfg.gaseousPhaseElements != "") {
+      std::cout << "Add gaseous phase with elements: " << cfg.gaseousPhaseElements << std::endl;
+      m_editor.addGaseousPhaseWithElements(cfg.gaseousPhaseElements);
+    }
+    if (cfg.gaseousPhaseSpecies != "") {
+      std::cout << "Add aqueous phase with species: " << cfg.gaseousPhaseSpecies << std::endl;
+      m_editor.addGaseousPhase(cfg.gaseousPhaseSpecies);
+    }
+    if (cfg.mineralPhaseElements != "") {
+      std::cout << "Add mineral phase with elements: " << cfg.mineralPhaseElements << std::endl;
+      m_editor.addMineralPhaseWithElements(cfg.mineralPhaseElements);
+    }
+    if (cfg.mineralPhaseSpecies != "") {
+      std::cout << "Add mineral phase with species: " << cfg.mineralPhaseSpecies << std::endl;
+      m_editor.addMineralPhase(cfg.mineralPhaseSpecies);
+    }
   } catch (std::exception &e) {
     std::cerr << "Error: " << e.what() << std::endl;
     return -1;
@@ -134,6 +254,7 @@ void UserEosModule::updateParams() {
   }
 
   if (m_hasSolidPhases) {
+    std::cout << "  New solid phase: SOL" << std::endl;
     m_phasesNames.push_back({'S', 'O', 'L'});
   }
 
@@ -167,7 +288,7 @@ void UserEosModule::updateParams() {
     std::copy_n(aux.data(), std::min(aux.length(), size_t(8)), name.begin());
     m_speciesNames.push_back(name);
 
-    std::cout << specie.name() << " (" << aux << ") ";
+    std::cout << specie.name() << ' ';
   }
   std::cout << std::endl;
 }
@@ -183,8 +304,8 @@ void UserEosModule::getParameters(char cmpNames[], double molWeights[], char phN
 
 bool UserEosModule::calculateEquilibrium(const double P, const double T, const double z[], int &nPhase, double props[],
                                          int8_t phaseId[], double auxArray[], int8_t mode) {
-  m_problem.setPressure(P);
-  m_problem.setTemperature(T);
+  m_problem.setPressure(P, "Pa");
+  m_problem.setTemperature(T, "K");
 
   double molesTotal = 0.0;
   for (int ic = 0; ic < nComponents(); ++ic) {
@@ -195,17 +316,31 @@ bool UserEosModule::calculateEquilibrium(const double P, const double T, const d
   Reaktoro::EquilibriumResult result;
 
   try {
-    result = m_solver.solve(state, m_problem);
+    m_solver.approximate(state, m_problem);
   } catch (std::exception &e) {
-    std::cerr << "Error: " << e.what() << std::endl;
+    std::cerr << "Error (approximate): " << e.what() << std::endl;
     std::cerr << "System params:" << std::endl;
-    logFailedParams(P, T, z);
+    logFailedParams(z);
+    state.output("failed.txt");
+    exit(1);
   }
 
-  if (!result.optimum.succeeded) {
-    std::cerr << "Error: the problem did not converge, system params:" << std::endl;
-    logFailedParams(P, T, z);
+  try {
+    result = m_solver.solve(state, m_problem);
+  } catch (std::exception &e) {
+    std::cerr << "Error (solve): " << e.what() << std::endl;
+    std::cerr << "System params:" << std::endl;
+    logFailedParams(z);
+    state.output("failed.txt");
+    exit(1);
   }
+
+  // if (!result.optimum.succeeded) {
+  //   std::cerr << "Error (convergence check): the problem did not converge, system params:" << std::endl;
+  //   logFailedParams(z);
+  //   state.output("failed.txt");
+  //   exit(1);
+  // }
 
   size_t offset = size_t(6 + nComponents());
   std::fill(props, props + nMaxPhases() * offset, 0.0);
@@ -243,6 +378,8 @@ bool UserEosModule::calculateEquilibrium(const double P, const double T, const d
     phaseId[ip] = int8_t(ip + 1);
   }
 
+  nPhase = nMaxPhases();
+
   if (m_hasSolidPhases) {
     int ip = m_fluidPhasesIds.size();
 
@@ -263,28 +400,34 @@ bool UserEosModule::calculateEquilibrium(const double P, const double T, const d
       }
     }
 
-    // Specific enthalpy
-    solidEnthalpy /= solidMass;
+    if (solidMass < 1e-12) {
+      nPhase--;
 
-    props[ip * offset + 0] = solidMass / solidVolume;
-    props[ip * offset + 1] = solidEnthalpy;
-    props[ip * offset + 2] = solidViscosity;
-    props[ip * offset + 3] = solidVolume / totalVolume;
+      props[ip * offset + 0] = NAN;
+      props[ip * offset + 1] = NAN;
+      props[ip * offset + 2] = NAN;
+      props[ip * offset + 3] = NAN;
+    } else {
+      // Specific enthalpy
+      solidEnthalpy /= solidMass;
 
-    double sumC = 0.0;
-    // Normalize the concentrations
-    for (int ic = 0; ic < nComponents(); ++ic) {
-      props[ip * offset + 6 + ic] /= solidMass;
-      sumC += props[ip * offset + 6 + ic];
+      props[ip * offset + 0] = solidMass / solidVolume;
+      props[ip * offset + 1] = solidEnthalpy;
+      props[ip * offset + 2] = solidViscosity;
+      props[ip * offset + 3] = solidVolume / totalVolume;
+
+      double sumC = 0.0;
+      // Normalize the concentrations
+      for (int ic = 0; ic < nComponents(); ++ic) {
+        props[ip * offset + 6 + ic] /= solidMass;
+        sumC += props[ip * offset + 6 + ic];
+      }
+      if (std::abs(sumC - 1.0) > 1e-15) {
+        std::cerr << "Error: solid concentrations do not sum to 1!!!\n";
+      }
+      phaseId[ip] = int8_t(ip + 1);
     }
-    if (std::abs(sumC - 1.0) > 1e-15) {
-      std::cerr << "Error: solid concentrations do not sum to 1!!!\n";
-    }
-
-    phaseId[ip] = int8_t(ip + 1);
   }
-
-  nPhase = nMaxPhases();
 
   for (int iem = 0; iem < nEndMembers(); ++iem) {
     auxArray[iem] = state.speciesAmount(iem);
@@ -293,12 +436,18 @@ bool UserEosModule::calculateEquilibrium(const double P, const double T, const d
   return true;
 }
 
-void UserEosModule::logFailedParams(const double P, const double T, const double z[]) const {
-  std::cerr << "P: " << P / 1e5 << " bar\n";
-  std::cerr << "T: " << T << " K\n";
+void UserEosModule::logFailedParams(const double z[]) const { logFailedParams(z, m_problem); }
+
+void UserEosModule::logFailedParams(const double z[], const Reaktoro::EquilibriumProblem &problem) const {
+  std::cerr << "P: " << problem.pressure() << " Pa\n";
+  std::cerr << "T: " << problem.temperature() << " K\n";
   std::cerr << "Elemental concentrations:\n";
   for (int ic = 0; ic < nComponents(); ++ic) {
     std::cerr << m_system.element(ic).name() << ": " << z[ic] << '\n';
+  }
+  std::cerr << "Elemental mole amounts:\n";
+  for (int ic = 0; ic < nComponents(); ++ic) {
+    std::cerr << m_system.element(ic).name() << ": " << problem.elementAmounts()[ic] << '\n';
   }
 }
 
